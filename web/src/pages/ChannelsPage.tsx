@@ -29,6 +29,9 @@ import type {
   MessagingPlatformEnvVar,
   MessagingPlatformUpdate,
   TelegramOnboardingStartResponse,
+  WhatsappOnboardingStartResponse,
+  WhatsappOnboardingStatusResponse,
+  WhatsappOnboardingMode,
 } from "@/lib/api";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
 import { usePageHeader } from "@/contexts/usePageHeader";
@@ -451,6 +454,14 @@ export default function ChannelsPage() {
                     showToast={showToast}
                   />
                 )}
+                {platform.id === "whatsapp" && (
+                  <WhatsappOnboardingPanel
+                    onChanged={load}
+                    onRestartNeeded={() => setRestartNeeded(true)}
+                    setRestartNeeded={setRestartNeeded}
+                    showToast={showToast}
+                  />
+                )}
               </CardContent>
             </Card>
           );
@@ -796,6 +807,529 @@ function TelegramOnboardingPanel({
                 <ExternalLink className="h-4 w-4" />
                 Open Telegram
               </a>
+              <Button size="sm" ghost onClick={() => void cancel()}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- WhatsApp dashboard-driven pairing (phone number + pairing code) ----
+//
+// State machine mirrors the backend:
+//   idle       -> user can input a phone number and click "Set up with phone"
+//   starting   -> POST /start fired; waiting for bridge.js to come up
+//   waiting    -> bridge alive, Baileys still bootstrapping (no QR yet)
+//   code       -> pairing code ready; show it big so the user can type
+//                 it into WhatsApp > Linked Devices > Link with phone
+//   paired     -> bridge reports connection === 'open' and creds.json
+//                 written; user clicks "I have paired" to apply
+//   error      -> bridge returned a pairing error; user can cancel/retry
+//   exited     -> bridge process died (e.g. --pair-only exit). Show exit
+//                 code and offer a fresh start.
+function WhatsappOnboardingPanel({
+  onChanged,
+  onRestartNeeded,
+  setRestartNeeded,
+  showToast,
+}: {
+  onChanged: () => Promise<void>;
+  onRestartNeeded: () => void;
+  setRestartNeeded: (needed: boolean) => void;
+  showToast: (message: string, type: "success" | "error") => void;
+}) {
+  const [phone, setPhone] = useState("");
+  // Two pairing modes: "phone" (8-char code, faster, no extra device
+  // needed) and "qr" (scan a QR with the phone's WA app, the more
+  // familiar flow). The QR path is the recovery option when phone
+  // pairing fails (e.g. WA's anti-spam blocks a rapid retry, the
+  // number is already linked elsewhere, etc.).
+  const [mode, setMode] = useState<WhatsappOnboardingMode>("phone");
+  const [setup, setSetup] = useState<WhatsappOnboardingStartResponse | null>(
+    null,
+  );
+  const [code, setCode] = useState("");
+  // ``qrDataUrl`` holds the latest PNG data URL fetched from the
+  // bridge's /pairing-qr endpoint. Refreshed on every poll so a
+  // missed ``connection.update`` event doesn't leave the UI showing
+  // a stale image.
+  const [qrDataUrl, setQrDataUrl] = useState("");
+  const [phase, setPhase] = useState<
+    | "idle"
+    | "starting"
+    | "waiting"
+    | "code"
+    | "paired"
+    | "applying"
+    | "error"
+    | "exited"
+  >("idle");
+  const [error, setError] = useState("");
+  const [exitCode, setExitCode] = useState<number | null>(null);
+  const [tick, setTick] = useState(0);
+
+  // Poll /status while a pairing is in flight. The backend transitions the
+  // bridge through starting -> waiting -> code -> paired; the UI just
+  // reflects whatever the latest /status payload reports.
+  useEffect(() => {
+    if (!setup) return;
+    if (
+      phase === "code" ||
+      phase === "paired" ||
+      phase === "error" ||
+      phase === "exited"
+    ) {
+      // Terminal-ish states: stop polling. Re-arm only when the user
+      // explicitly retries (which goes back to "starting").
+      return;
+    }
+    let cancelled = false;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      try {
+        const status: WhatsappOnboardingStatusResponse =
+          await api.getWhatsappOnboardingStatus(setup.pairing_id);
+        if (cancelled) return;
+        // In QR mode the latest PNG data URL is returned inline with
+        // ``waiting``; capture it before falling through to the phase
+        // switch so the <img> tag updates every poll.
+        if ("qr" in status && status.qr) {
+          setQrDataUrl(status.qr);
+        }
+        switch (status.status) {
+          case "starting":
+          case "waiting":
+            setError("");
+            setPhase(status.status);
+            break;
+          case "code":
+            setCode(status.code);
+            setError("");
+            setPhase("code");
+            break;
+          case "paired":
+            setCode(status.code ?? code);
+            setError("");
+            setPhase("paired");
+            return; // stop polling
+          case "error":
+            setError(status.error);
+            setPhase("error");
+            return;
+          case "exited":
+            setExitCode(status.exit_code);
+            setPhase("exited");
+            return;
+        }
+        timeout = setTimeout(poll, 2000);
+      } catch (pollError) {
+        if (cancelled) return;
+        setError(`Pairing service unreachable: ${pollError}`);
+        timeout = setTimeout(poll, 3000);
+      }
+    };
+    timeout = setTimeout(poll, 1200);
+    return () => {
+      cancelled = true;
+      if (timeout) clearTimeout(timeout);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, setup]);
+
+  // Drive the "expires in" countdown badge. Matches the Telegram UX.
+  useEffect(() => {
+    if (!setup) return;
+    const timer = setInterval(() => setTick((value) => value + 1), 1000);
+    return () => clearInterval(timer);
+  }, [setup]);
+
+  // Make sure we never leave a bridge process running when the panel
+  // unmounts (e.g. user navigates away mid-pairing). The backend's
+  // TTL is a safety net, not a substitute for explicit cleanup.
+  useEffect(() => {
+    return () => {
+      if (setup && phase !== "paired") {
+        void api.cancelWhatsappOnboarding(setup.pairing_id).catch(() => {});
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const reset = () => {
+    setSetup(null);
+    setCode("");
+    setPhone("");
+    setQrDataUrl("");
+    setPhase("idle");
+    setError("");
+    setExitCode(null);
+  };
+
+  const start = async () => {
+    if (mode === "phone") {
+      // Strip everything but digits — backend re-validates, this is just UX.
+      const normalized = phone.replace(/\D+/g, "");
+      if (normalized.length < 6) {
+        setError("Enter a valid phone number in international format.");
+        return;
+      }
+      setPhase("starting");
+      setError("");
+      setCode("");
+      setQrDataUrl("");
+      try {
+        const res = await api.startWhatsappOnboarding({
+          phone: normalized,
+          mode: "phone",
+        });
+        setSetup(res);
+        setPhase("waiting");
+      } catch (startError) {
+        setPhase("idle");
+        setError(String(startError));
+      }
+    } else {
+      // QR mode: no phone required; backend spawns the bridge without
+      // --phone so the first QR event renders the data URL.
+      setPhase("starting");
+      setError("");
+      setCode("");
+      setQrDataUrl("");
+      try {
+        const res = await api.startWhatsappOnboarding({ mode: "qr" });
+        setSetup(res);
+        setPhase("waiting");
+      } catch (startError) {
+        setPhase("idle");
+        setError(String(startError));
+      }
+    }
+  };
+
+  const cancel = async () => {
+    if (setup) {
+      try {
+        await api.cancelWhatsappOnboarding(setup.pairing_id);
+      } catch {
+        /* local cleanup still wins */
+      }
+    }
+    reset();
+  };
+
+  // Watch the in-flight gateway restart the same way Telegram does.
+  // Surface a non-zero exit via the manual restart banner so the user
+  // can recover if the restart died (e.g. systemd linger missing).
+  const watchRestartOutcome = async () => {
+    for (let i = 0; i < 20; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      try {
+        const st = await api.getActionStatus("gateway-restart", 5);
+        if (st.running) continue;
+        if (st.exit_code !== 0 && st.exit_code !== null) {
+          onRestartNeeded();
+          showToast(
+            `Gateway restart failed (exit ${st.exit_code}) — restart manually`,
+            "error",
+          );
+        }
+        return;
+      } catch {
+        // transient fetch error; keep polling
+      }
+    }
+  };
+
+  const apply = async () => {
+    if (!setup) return;
+    setPhase("applying");
+    setError("");
+    try {
+      const result = await api.applyWhatsappOnboarding(setup.pairing_id);
+      reset();
+      if (result.restart_started) {
+        showToast("WhatsApp saved; gateway restarting…", "success");
+        setRestartNeeded(false);
+        setTimeout(() => void onChanged(), 4000);
+        void watchRestartOutcome();
+      } else {
+        onRestartNeeded();
+        const detail = result.restart_error ? `: ${result.restart_error}` : "";
+        showToast(
+          `WhatsApp saved; gateway restart failed${detail}`,
+          "error",
+        );
+      }
+      await onChanged();
+    } catch (applyError) {
+      setPhase("paired");
+      setError(String(applyError));
+    }
+  };
+
+  // Memoized countdown for the "code" phase. Mirrors the Telegram UX.
+  const expiresIn = useMemo(() => {
+    if (!setup) return "";
+    void tick; // keep memo tied to tick
+    const ms = setup.expires_at * 1000 - Date.now();
+    if (!Number.isFinite(ms) || ms <= 0) return "expired";
+    const seconds = Math.ceil(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const rest = seconds % 60;
+    return `${minutes}:${rest.toString().padStart(2, "0")}`;
+  }, [setup, tick]);
+
+  return (
+    <div className="rounded-sm border border-border bg-background/35 p-4">
+      {/* Mode toggle. The two flows are mutually exclusive for a
+          given pairing session (a bridge is either in --phone or QR
+          mode), so we render a segmented switch instead of two
+          separate buttons. The "idle / error / exited" phases are
+          the only ones where the user can switch modes mid-flight
+          without re-arming everything. */}
+      <div className="mb-3 flex items-center gap-2">
+        <span className="text-xs uppercase tracking-[0.12em] text-muted-foreground shrink-0">
+          Mode
+        </span>
+        <div className="inline-flex rounded-sm border border-border overflow-hidden">
+          <button
+            type="button"
+            onClick={() => {
+              if (phase === "idle" || phase === "error" || phase === "exited") {
+                setMode("phone");
+              }
+            }}
+            disabled={
+              phase !== "idle" && phase !== "error" && phase !== "exited"
+            }
+            className={
+              "px-3 py-1 text-xs uppercase tracking-[0.12em] transition-colors " +
+              (mode === "phone"
+                ? "bg-primary text-primary-foreground"
+                : "bg-background/40 text-muted-foreground hover:bg-foreground/5")
+            }
+            data-testid="wa-mode-phone"
+          >
+            Phone
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (phase === "idle" || phase === "error" || phase === "exited") {
+                setMode("qr");
+              }
+            }}
+            disabled={
+              phase !== "idle" && phase !== "error" && phase !== "exited"
+            }
+            className={
+              "px-3 py-1 text-xs uppercase tracking-[0.12em] transition-colors " +
+              (mode === "qr"
+                ? "bg-primary text-primary-foreground"
+                : "bg-background/40 text-muted-foreground hover:bg-foreground/5")
+            }
+            data-testid="wa-mode-qr"
+          >
+            QR
+          </button>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:flex-wrap">
+        {mode === "phone" ? (
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <Label
+              htmlFor="wa-phone"
+              className="shrink-0 text-xs uppercase tracking-[0.12em] text-muted-foreground"
+            >
+              Phone
+            </Label>
+            <Input
+              id="wa-phone"
+              value={phone}
+              onChange={(event) => setPhone(event.target.value)}
+              placeholder="6281234567890"
+              inputMode="tel"
+              className="font-courier flex-1 min-w-0"
+              disabled={
+                phase !== "idle" && phase !== "error" && phase !== "exited"
+              }
+            />
+          </div>
+        ) : (
+          <div className="flex-1 min-w-0 text-sm text-muted-foreground">
+            Scan the QR with WhatsApp on your phone — no number required.
+          </div>
+        )}
+        <Button
+          size="sm"
+          className="uppercase"
+          onClick={() => void start()}
+          disabled={
+            phase === "starting" ||
+            phase === "waiting" ||
+            phase === "code" ||
+            phase === "paired" ||
+            phase === "applying"
+          }
+          prefix={
+            phase === "starting" ? <Spinner /> : <PlugZap className="h-4 w-4" />
+          }
+        >
+          {phase === "starting"
+            ? "Starting…"
+            : setup
+              ? "Restart pairing"
+              : mode === "qr"
+                ? "Generate QR"
+                : "Set up with phone"}
+        </Button>
+      </div>
+
+      <p className="mt-2 text-xs text-muted-foreground">
+        {mode === "phone"
+          ? "Pair without scanning a QR code. Enter the 8-character pairing code in WhatsApp → Settings → Linked Devices → Link with phone number."
+          : "Scan the QR with WhatsApp → Settings → Linked Devices → Link a device. Use this if the phone code path fails or your number is already linked elsewhere."}
+      </p>
+
+      {error && (
+        <div className="mt-3 border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      {phase === "exited" && (
+        <div className="mt-3 border border-warning/40 bg-warning/10 px-3 py-2 text-sm">
+          Pairing bridge exited
+          {exitCode !== null ? ` (code ${exitCode})` : ""}.{" "}
+          <button
+            type="button"
+            className="underline hover:no-underline"
+            onClick={() => {
+              setPhase("idle");
+              setError("");
+            }}
+          >
+            Try again
+          </button>
+        </div>
+      )}
+
+      {(phase === "waiting" || phase === "code" || phase === "paired") && (
+        <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
+          <div className="grid gap-3">
+            {phase === "paired" && (
+              <div className="grid gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge tone="success">Paired</Badge>
+                  <span className="font-courier text-sm text-muted-foreground">
+                    {setup?.phone}
+                  </span>
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  Your phone is linked. Save and restart the gateway to start
+                  receiving messages.
+                </p>
+                {code && (
+                  <div className="grid gap-1">
+                    <span className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
+                      Pairing code used
+                    </span>
+                    <span className="font-courier text-lg">{code}</span>
+                  </div>
+                )}
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    className="uppercase"
+                    onClick={() => void apply()}
+                    disabled={phase !== "paired"}
+                    prefix={<Save className="h-4 w-4" />}
+                  >
+                    Save and restart
+                  </Button>
+                  <Button size="sm" ghost onClick={() => void cancel()}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {(phase === "waiting" || phase === "code") && (
+              <div className="grid gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge tone={phase === "code" ? "outline" : "warning"}>
+                    {phase === "code"
+                      ? "Enter code on phone"
+                      : "Waiting for WhatsApp…"}
+                  </Badge>
+                  {setup?.phone && (
+                    <span className="font-courier text-sm text-muted-foreground">
+                      {setup.phone}
+                    </span>
+                  )}
+                </div>
+                {phase === "waiting" && (
+                  <p className="text-sm text-muted-foreground">
+                    Connecting to WhatsApp servers and generating your pairing
+                    code…
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-col items-center justify-center gap-3">
+            {mode === "qr" ? (
+              <div className="grid gap-1 text-center" data-testid="wa-qr-wrap">
+                <span className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
+                  Scan with WhatsApp
+                </span>
+                {qrDataUrl ? (
+                  // ``img`` not ``Image`` — the data URL is already
+                  // in-memory and we want zero extra round-trips or
+                  // SSR. ``max-w-full`` keeps it from overflowing the
+                  // 260px column.
+                  <img
+                    src={qrDataUrl}
+                    alt="WhatsApp pairing QR"
+                    width={240}
+                    height={240}
+                    className="bg-white p-2 border border-border max-w-full h-auto"
+                    data-testid="whatsapp-pairing-qr"
+                  />
+                ) : (
+                  <div className="w-[240px] h-[240px] flex items-center justify-center border border-border bg-foreground/5">
+                    <Spinner className="text-3xl text-primary" />
+                  </div>
+                )}
+                <span className="text-[10px] text-muted-foreground">
+                  QR refreshes automatically while you scan
+                </span>
+              </div>
+            ) : phase === "code" && code ? (
+              <div className="grid gap-1 text-center">
+                <span className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
+                  Pairing code
+                </span>
+                <span
+                  className="font-courier text-3xl tracking-widest bg-foreground/5 border border-border px-4 py-3"
+                  data-testid="whatsapp-pairing-code"
+                >
+                  {code}
+                </span>
+                <Badge tone={expiresIn === "expired" ? "destructive" : "outline"}>
+                  {expiresIn}
+                </Badge>
+              </div>
+            ) : (
+              <Spinner className="text-3xl text-primary" />
+            )}
+            <div className="flex flex-wrap justify-center gap-2">
               <Button size="sm" ghost onClick={() => void cancel()}>
                 Cancel
               </Button>

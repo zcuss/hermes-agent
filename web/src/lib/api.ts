@@ -336,8 +336,12 @@ export const api = {
       window.location.assign("/login");
       return r;
     }),
-  getSessions: (limit = 20, offset = 0) =>
-    fetchJSON<PaginatedSessions>(`/api/sessions?limit=${limit}&offset=${offset}`),
+  getSessions: (limit = 20, offset = 0, minMessages = 0, archived = "exclude", order = "created", source?: string, excludeSources?: string) => {
+    let url = `/api/sessions?limit=${limit}&offset=${offset}&min_messages=${minMessages}&archived=${archived}&order=${order}`;
+    if (source) url += `&source=${encodeURIComponent(source)}`;
+    if (excludeSources) url += `&exclude_sources=${encodeURIComponent(excludeSources)}`;
+    return fetchJSON<PaginatedSessions>(url);
+  },
   getSessionMessages: (id: string) =>
     fetchJSON<SessionMessagesResponse>(`/api/sessions/${encodeURIComponent(id)}/messages`),
   getSessionLatestDescendant: (id: string) =>
@@ -371,7 +375,13 @@ export const api = {
     ),
   getSessionStats: () => fetchJSON<SessionStoreStats>("/api/sessions/stats"),
   exportSessionUrl: (id: string) =>
-    `/api/sessions/${encodeURIComponent(id)}/export`,
+    `${BASE}/api/sessions/${encodeURIComponent(id)}/export`,
+  sendSessionPrompt: (id: string, prompt: string) =>
+    fetchJSON<{ ok: boolean }>("/api/sessions/chat-prompt-proxy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, prompt }),
+    }),
   pruneSessions: (older_than_days: number, source?: string) =>
     fetchJSON<{ ok: boolean; removed: number }>("/api/sessions/prune", {
       method: "POST",
@@ -784,6 +794,33 @@ export const api = {
   cancelTelegramOnboarding: (pairingId: string) =>
     fetchJSON<{ ok: boolean }>(
       `/api/messaging/telegram/onboarding/${encodeURIComponent(pairingId)}`,
+      { method: "DELETE" },
+    ),
+
+  // WhatsApp pairing flow: phone -> pairing code -> apply, OR QR
+  // scan.  See web_server.py for the backend state machine; mirrored in
+  // WhatsappOnboardingPanel on the Channels page.
+  startWhatsappOnboarding: (body: WhatsappOnboardingStartRequest) =>
+    fetchJSON<WhatsappOnboardingStartResponse>(
+      "/api/messaging/whatsapp/onboarding/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  getWhatsappOnboardingStatus: (pairingId: string) =>
+    fetchJSON<WhatsappOnboardingStatusResponse>(
+      `/api/messaging/whatsapp/onboarding/${encodeURIComponent(pairingId)}`,
+    ),
+  applyWhatsappOnboarding: (pairingId: string) =>
+    fetchJSON<WhatsappOnboardingApplyResponse>(
+      `/api/messaging/whatsapp/onboarding/${encodeURIComponent(pairingId)}/apply`,
+      { method: "POST" },
+    ),
+  cancelWhatsappOnboarding: (pairingId: string) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/messaging/whatsapp/onboarding/${encodeURIComponent(pairingId)}`,
       { method: "DELETE" },
     ),
 
@@ -1554,6 +1591,9 @@ export interface StatusResponse {
   latest_config_version: number;
   release_date: string;
   version: string;
+  sys_cpu?: number;
+  sys_ram?: number;
+  sys_uptime?: number;
 }
 
 export interface SessionInfo {
@@ -1621,6 +1661,49 @@ export interface TelegramOnboardingApplyResponse {
   ok: boolean;
   platform: "telegram";
   bot_username?: string;
+  needs_restart: boolean;
+  restart_started?: boolean;
+  restart_action?: string;
+  restart_pid?: number | null;
+  restart_error?: string;
+}
+
+// ---- WhatsApp pairing (phone number + pairing code, or QR scan) ----
+export type WhatsappOnboardingMode = "phone" | "qr";
+
+export interface WhatsappOnboardingStartRequest {
+  phone?: string;
+  mode?: WhatsappOnboardingMode;
+}
+
+export interface WhatsappOnboardingStartResponse {
+  pairing_id: string;
+  phone: string;
+  mode: WhatsappOnboardingMode;
+  port: number;
+  log_path: string;
+  started_at: number;
+  expires_at: number;
+}
+
+export type WhatsappOnboardingStatusResponse =
+  | { status: "starting"; mode?: WhatsappOnboardingMode; phone: string; log_path: string }
+  | { status: "waiting"; mode: WhatsappOnboardingMode; phone: string; qr?: string | null; log_path: string }
+  | { status: "code"; mode: WhatsappOnboardingMode; phone: string; code: string; log_path: string }
+  | { status: "paired"; mode: WhatsappOnboardingMode; phone: string; code?: string; log_path: string }
+  | { status: "error"; mode: WhatsappOnboardingMode; phone: string; error: string; log_path: string }
+  | {
+      status: "exited";
+      mode?: WhatsappOnboardingMode;
+      phone: string;
+      exit_code: number | null;
+      log_path: string;
+    };
+
+export interface WhatsappOnboardingApplyResponse {
+  ok: boolean;
+  platform: "whatsapp";
+  phone: string;
   needs_restart: boolean;
   restart_started?: boolean;
   restart_action?: string;

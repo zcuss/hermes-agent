@@ -29,11 +29,20 @@ import { randomBytes, createHash } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
+// ``qrcode`` (no -terminal) is used to render the QR as a PNG data URL
+// for the dashboard's <img> tag. Resolved from the root
+// ``node_modules`` since the bridge script lives in a subdirectory but
+// the package is hoisted to the workspace root.
+import qrcodeImage from 'qrcode';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 
-// Parse CLI args
+// Parse CLI args. Supports both `--name value` and `--name=value` forms
+// (the Python gateway prefers `=` for shell-safe quoting, while the
+// local CLI historically used the space form — keep both working).
 const args = process.argv.slice(2);
 function getArg(name, defaultVal) {
+  const eq = args.find((a) => a.startsWith(`--${name}=`));
+  if (eq) return eq.split('=').slice(1).join('=');
   const idx = args.indexOf(`--${name}`);
   return idx !== -1 && args[idx + 1] ? args[idx + 1] : defaultVal;
 }
@@ -196,6 +205,36 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+// Pairing state (drives /health + /pairing-code + JSON events to stdout).
+// Populated when --phone is supplied and Baileys emits a QR; cleared on
+// cancel.  Surfaced via the dashboard so it can render the 8-char code
+// without scraping the bridge.log file.
+let pairingCode = '';
+let pairingPhone = '';
+let pairingError = '';
+// QR data URL (PNG base64) for QR mode. Refreshed on every QR emit so
+// the dashboard's <img> tag stays in sync with whatever WA's QR is
+// currently showing. Cleared on successful pairing or cancel.
+let pairingQrDataUrl = '';
+let pairedAt = 0; // ms epoch — non-zero once connection === 'open' with creds
+let connectionEverOpen = false; // true once the socket has reached 'open' state at least once
+let pairingComplete = false; // true after a successful pairing in --pair-only mode
+// Reconnect bookkeeping. WhatsApp's anti-spam throttles devices that
+// hammer the auth endpoints, so a blanket ``setTimeout(startSocket, 2000)``
+// on every disconnect can land the device in a temporary ban. We:
+//   1. Cap the number of reconnect attempts within a window
+//   2. Apply exponential backoff (2s, 4s, 8s, 16s, 32s, capped at 60s)
+//   3. In ``--pair-only`` mode we *never* auto-reconnect — a disconnect
+//      before the user finished entering the code means the code is
+//      dead anyway, so the bridge exits and the dashboard can re-spawn.
+let reconnectAttempts = 0;
+let lastReconnectAt = 0;
+const RECONNECT_MAX_IN_WINDOW = 4;
+const RECONNECT_WINDOW_MS = 60_000;
+// Mode is set at boot: 'phone' (--phone=X) or 'qr' (default when no --phone).
+// Used to decide which dashboard UI to render and to skip the pairing
+// code request when in QR mode (avoids the 3s pre-code delay).
+const PAIRING_MODE = process.argv.find((a) => a.startsWith('--phone=')) ? 'phone' : 'qr';
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -220,38 +259,184 @@ async function startSocket() {
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
       qrcode.generate(qr, { small: true });
       console.log('\nWaiting for scan...\n');
+
+      // Render the same QR as a PNG data URL for the dashboard's
+      // <img src=...> tag. Done in addition to the terminal print so
+      // the user can scan from their phone without needing terminal
+      // access. Re-emitted on every QR refresh (Baileys rotates QRs
+      // ~ every 60s).
+      try {
+        // ``qrcode`` is the same package; ``toDataURL`` returns a
+        // base64 PNG without writing to disk. ``small: true`` keeps the
+        // payload small enough to ship in a /health poll every 2s.
+        pairingQrDataUrl = await qrcodeImage.toDataURL(qr, {
+          errorCorrectionLevel: 'M',
+          margin: 1,
+          scale: 6,
+          color: { dark: '#000000', light: '#ffffff' },
+        });
+      } catch (err) {
+        // Non-fatal: the terminal print is still the source of truth.
+        console.error('⚠️ Failed to render QR data URL:', err);
+      }
+
+      // Pairing code fallback logic (only in 'phone' mode). In 'qr' mode
+      // the user scans the QR from the dashboard, no code is needed —
+      // skipping the requestPairingCode call also avoids the 3s sleep
+      // blocking the QR stream.
+      if (PAIRING_MODE === 'phone') {
+        const phoneArg = process.argv.find(arg => arg.startsWith('--phone='));
+        if (phoneArg) {
+          const phone = phoneArg.split('=')[1];
+          pairingPhone = phone;
+          console.log(`📱 Requesting pairing code for phone: ${phone}`);
+          try {
+            // Wait 3s to let the socket establish connection to WA servers before requesting code
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            const code = await sock.requestPairingCode(phone);
+            const formatted = `${code.slice(0,4)}-${code.slice(4)}`;
+            pairingCode = formatted;
+            pairingError = '';
+            console.log(`\n🔑 YOUR PAIRING CODE IS: ${formatted}\n`);
+            // Structured event for the dashboard backend (no more screen-dump scraping).
+            try {
+              console.log(JSON.stringify({
+                event: 'pairing_code',
+                phone,
+                code: formatted,
+              }));
+            } catch {}
+          } catch (err) {
+            pairingError = String(err?.message || err);
+            console.error('⚠️ Failed to request pairing code:', err);
+            try {
+              console.log(JSON.stringify({ event: 'pairing_error', phone, error: pairingError }));
+            } catch {}
+          }
+        }
+      }
     }
 
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
 
-      if (reason === DisconnectReason.loggedOut) {
-        console.log('❌ Logged out. Delete session and restart to re-authenticate.');
+      // Pairing-mode 401 grace period: in ``--pair-only`` mode, transient
+      // 401s happen frequently *before* the user has finished pairing
+      // (e.g. the device-revoked check fires once on the very first
+      // connection attempt with empty creds, or the user types a wrong
+      // / expired code and WA rejects the session). Treating those as a
+      // hard logout would wipe the session mid-pairing and exit the
+      // bridge — the user would never be able to retry without
+      // restarting the dashboard.
+      //
+      // Only escalate to "logged out → wipe session → exit" once the
+      // connection has been ``open`` at least once (i.e. pairing
+      // succeeded) and then a *subsequent* 401 arrives. Pre-pairing
+      // 401s are logged and ignored; the bridge keeps waiting for the
+      // user to enter the code.
+      const everConnected = connectionEverOpen || pairingComplete;
+      const hardLogout =
+        reason === DisconnectReason.loggedOut ||
+        reason === 401 ||
+        (lastDisconnect?.error?.output?.payload?.message || '').includes('device_removed');
+
+      if (hardLogout && (everConnected || !PAIR_ONLY)) {
+        console.log('❌ Logged out (401/device_removed). Cleaning session directory...');
+        try {
+          // Clear session files to prevent loop reconnecting with stale creds
+          const files = readdirSync(SESSION_DIR);
+          for (const file of files) {
+            unlinkSync(path.join(SESSION_DIR, file));
+          }
+          console.log('🧹 Session cleared successfully.');
+        } catch (err) {
+          console.error('⚠️ Failed to clean session directory:', err);
+        }
+        process.exit(1);
+      } else if (hardLogout) {
+        // Pre-pairing 401 in --pair-only mode. Two scenarios:
+        //   1. Fresh session: a 401 here is WA's anti-spam kicking in.
+        //      Auto-reconnecting would loop the bridge into a ban, so
+        //      we exit and let the dashboard respawn a clean process.
+        //   2. Stale code entered: the code is dead, the user must
+        //      restart pairing. Exiting is the right move there too.
+        // In both cases, no re-arm, no reconnect — the dashboard
+        // surfaces "Pairing bridge exited" and the user can retry
+        // manually after a backoff.
+        console.log(
+          `⚠️  Pre-pairing ${reason} — exiting to avoid WA anti-spam loop. ` +
+          'User must restart pairing from the dashboard.',
+        );
         process.exit(1);
       } else {
-        // 515 = restart requested (common after pairing). Always reconnect.
+        // Non-401 disconnect. Two cases that need different treatment:
+        //   515 = server-requested restart (common right after pairing
+        //         succeeds but before the app is fully ready). Always
+        //         reconnect, but with a small fixed delay.
+        //   Anything else = network blip, server overload, etc. Use
+        //         exponential backoff and abort after RECONNECT_MAX_IN_WINDOW
+        //         attempts inside RECONNECT_WINDOW_MS to stay clear of
+        //         WA's anti-spam threshold.
         if (reason === 515) {
           console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
+          setTimeout(startSocket, 1000);
         } else {
-          console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
+          const now = Date.now();
+          if (now - lastReconnectAt > RECONNECT_WINDOW_MS) {
+            // Window expired — reset counter so a long-stable connection
+            // followed by a single blip doesn't carry old attempts.
+            reconnectAttempts = 0;
+          }
+          reconnectAttempts += 1;
+          lastReconnectAt = now;
+          if (reconnectAttempts > RECONNECT_MAX_IN_WINDOW) {
+            console.error(
+              `❌ Reconnect cap hit (${reconnectAttempts} attempts in ` +
+              `${RECONNECT_WINDOW_MS / 1000}s). Exiting to avoid WA ban.`,
+            );
+            process.exit(2);
+          }
+          // Exponential backoff: 2s, 4s, 8s, 16s, 32s, capped at 60s.
+          const delay = Math.min(60_000, 2000 * 2 ** (reconnectAttempts - 1));
+          console.log(
+            `⚠️  Connection closed (reason: ${reason}). ` +
+            `Reconnect attempt ${reconnectAttempts}/${RECONNECT_MAX_IN_WINDOW} ` +
+            `in ${delay / 1000}s...`,
+          );
+          setTimeout(startSocket, delay);
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      connectionEverOpen = true;
+      // Reset the reconnect budget on a successful open so the next
+      // disconnect (e.g. hours later after a stable session) starts
+      // fresh instead of inheriting old attempt counts.
+      reconnectAttempts = 0;
       console.log('✅ WhatsApp connected!');
+      try {
+        console.log(JSON.stringify({
+          event: 'paired',
+          phone: pairingPhone,
+          user: sock?.user?.id || '',
+        }));
+      } catch {}
       if (PAIR_ONLY) {
-        console.log('✅ Pairing complete. Credentials saved.');
-        // Give Baileys a moment to flush creds, then exit cleanly
-        setTimeout(() => process.exit(0), 2000);
+        console.log('✅ Pairing complete. Credentials saved. Staying alive for dashboard apply/cancel.');
+        // Stay alive (don't exit) so the dashboard can confirm the paired
+        // state via /health, then either kill this process on apply or
+        // leave it running.  The platform adapter's next connect() will
+        // pick up the persisted creds.json and start a full bridge.
+        pairedAt = Date.now();
+        pairingComplete = true;
       }
     }
   });
@@ -721,16 +906,64 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    pairing: {
+      active: !!(pairingPhone || pairingQrDataUrl),
+      mode: PAIRING_MODE,
+      phone: pairingPhone,
+      code: pairingCode,
+      error: pairingError,
+      paired: !!pairedAt,
+      has_qr: !!pairingQrDataUrl,
+    },
+  });
+});
+
+// Pairing QR snapshot (PNG data URL). Returns the latest QR rendered
+// from the Baileys `qr` event. 404 if the bridge is in 'phone' mode or
+// no QR has been emitted yet.
+app.get('/pairing-qr', (req, res) => {
+  if (PAIRING_MODE !== 'qr') {
+    return res.status(400).json({ error: 'Bridge is in phone-pairing mode' });
+  }
+  if (!pairingQrDataUrl) {
+    return res.status(404).json({ error: 'No QR available yet' });
+  }
+  res.json({
+    mode: PAIRING_MODE,
+    qr: pairingQrDataUrl,
+    paired: !!pairedAt,
+  });
+});
+
+// Pairing code snapshot (explicit endpoint for the dashboard).
+// Returns the current code if a pairing flow is in progress; 404 if not.
+app.get('/pairing-code', (req, res) => {
+  if (!pairingPhone) {
+    return res.status(404).json({ error: 'No pairing in progress' });
+  }
+  res.json({
+    phone: pairingPhone,
+    code: pairingCode,
+    error: pairingError,
+    paired: !!pairedAt,
   });
 });
 
 // Start
 if (PAIR_ONLY) {
-  // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
+  // Pair-only mode: keep the bridge alive long enough for the dashboard
+  // to poll /health + /pairing-code. The HTTP server runs on the same
+  // port as the full bridge — there should only ever be one instance
+  // (the dashboard enforces a single pairing at a time). We deliberately
+  // do NOT start the full message queue / /send / /messages handlers
+  // beyond the endpoints required for the pairing state machine.
   console.log('📱 WhatsApp pairing mode');
   console.log(`📁 Session: ${SESSION_DIR}`);
   console.log();
-  startSocket();
+  app.listen(PORT, '127.0.0.1', () => {
+    console.log(`🌉 WhatsApp pairing bridge listening on port ${PORT}`);
+    startSocket();
+  });
 } else {
   app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);

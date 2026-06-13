@@ -1543,7 +1543,17 @@ async def fs_default_cwd():
 @app.get("/api/status")
 async def get_status():
     current_ver, latest_ver = check_config_version()
-
+    
+    # --- System Metrics ---
+    import psutil
+    import time
+    cpu_percent = psutil.cpu_percent()
+    ram = psutil.virtual_memory()
+    ram_percent = ram.percent
+    
+    # Calculate uptime
+    uptime_seconds = int(time.time() - psutil.boot_time())
+    
     # --- Gateway liveness detection ---
     # Try local PID check first (same-host).  If that fails and a remote
     # GATEWAY_HEALTH_URL is configured, probe the gateway over HTTP so the
@@ -1658,6 +1668,9 @@ async def get_status():
         "active_sessions": active_sessions,
         "auth_required": auth_required,
         "auth_providers": auth_providers,
+        "sys_cpu": cpu_percent,
+        "sys_ram": ram_percent,
+        "sys_uptime": uptime_seconds,
     }
 
 
@@ -4704,6 +4717,510 @@ async def cancel_telegram_onboarding(pairing_id: str):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# WhatsApp dashboard-driven pairing (phone number + pairing code).
+#
+# Why a separate subprocess instead of reusing the live gateway bridge?
+# The platform adapter only spawns `bridge.js` AFTER a successful connect(),
+# which requires `creds.json` to exist. Pairing is the bootstrap that
+# *creates* `creds.json`, so it has to run in a dedicated `--pair-only`
+# instance. Once pairing succeeds and the dashboard applies, the gateway
+# restart picks up the persisted creds and starts a full bridge normally.
+# ---------------------------------------------------------------------------
+
+# Default bridge location — mirrors the platform adapter's _DEFAULT_BRIDGE_DIR
+# so the dashboard spawns the same script the adapter would.
+_WHATSAPP_DEFAULT_BRIDGE = (
+    PROJECT_ROOT / "scripts" / "whatsapp-bridge" / "bridge.js"
+)
+# Default session path — same fallback chain as the adapter.
+_WHATSAPP_DEFAULT_SESSION_DIR = get_hermes_home() / "whatsapp" / "session"
+# Default pairing port = adapter bridge_port (3000) + 1, so they never collide.
+# Allocated per-pairing from this base onward in case of port collision.
+_WHATSAPP_PAIRING_PORT_BASE = 3010
+# Hard ceiling for one pairing attempt. Pairing codes refresh on QR events,
+# but a stuck bridge should not keep a dashboard session alive forever.
+_WHATSAPP_PAIRING_TTL_SECONDS = 600
+# Bound how long /status will keep polling before failing the dashboard.
+_WHATSAPP_PAIRING_HTTP_TIMEOUT = 3.0
+# E.164 digits only (no leading +, allow optional country prefix).
+_WHATSAPP_PHONE_RE = re.compile(r"^\d{6,15}$")
+
+
+@dataclass
+class _WhatsappOnboardingPairing:
+    phone: str
+    session_dir: str
+    port: int
+    proc: subprocess.Popen
+    started_at: float
+    log_path: Path
+    last_code: str = ""
+    last_error: str = ""
+    paired: bool = False
+    # ``mode`` is "phone" (8-char code) or "qr" (scan data URL).
+    # Inherited from the start request and surfaced via /status so the
+    # dashboard can decide which UI to render without re-asking.
+    mode: str = "phone"
+    # ``last_qr`` caches the most recent QR data URL from the bridge's
+    # /pairing-qr endpoint so the dashboard can poll /status and get
+    # everything in one round-trip (no separate image fetch needed).
+    last_qr: str = ""
+
+
+_whatsapp_onboarding_pairings: dict[str, _WhatsappOnboardingPairing] = {}
+_whatsapp_onboarding_lock = threading.RLock()
+
+
+def _prune_whatsapp_onboarding_pairings() -> None:
+    """Drop pairing records whose bridge subprocess has already exited.
+
+    Two failure modes are handled:
+    * TTL-expired: the record is older than the allowed pairing window.
+    * Dead proc: the bridge subprocess finished (paired, errored, or got
+      SIGKILL'd) but the record is still in the dict, locking the user
+      out with a stale 409. Common after a 401/500 in the bridge or a
+      manual ``kill`` from another shell.
+
+    Records with a still-alive subprocess are kept so the user can resume
+    the in-flight pairing (e.g. they navigated away and came back).
+    """
+    now = time.time()
+    with _whatsapp_onboarding_lock:
+        stale: list[str] = []
+        for pid, rec in _whatsapp_onboarding_pairings.items():
+            proc_alive = rec.proc.poll() is None
+            ttl_expired = (now - rec.started_at) > _WHATSAPP_PAIRING_TTL_SECONDS
+            if (not proc_alive) or ttl_expired:
+                # If the proc is dead, reap it so we don't leak zombies
+                # (the bridge writes creds.json on exit; concurrent writers
+                # corrupt the file and trigger the well-known WA lock
+                # pattern).
+                if not proc_alive:
+                    try:
+                        rec.proc.wait(timeout=0)
+                    except Exception:
+                        pass
+                stale.append(pid)
+        for pid in stale:
+            _whatsapp_onboarding_pairings.pop(pid, None)
+
+
+def _kill_whatsapp_pairing_pairing(pid: str) -> None:
+    """Best-effort terminate of a pairing bridge subprocess.
+
+    Uses SIGTERM first; escalates to SIGKILL after 2s if the process is
+    still alive. We MUST reap zombies because the bridge writes creds.json
+    on exit, and a second concurrent writer corrupts the file (this is the
+    well-known "lock akun WA" pattern).
+    """
+    with _whatsapp_onboarding_lock:
+        rec = _whatsapp_onboarding_pairings.get(pid)
+    if rec is None:
+        return
+    proc = rec.proc
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _allocate_whatsapp_pairing_port() -> int:
+    """Pick a free TCP port for the pairing bridge.
+
+    The adapter normally owns port 3000; pairing uses 3010+ to avoid
+    stepping on the running gateway. We verify the port is free and
+    bump on EADDRINUSE so two simultaneous dashboard pairings do not
+    collide.
+    """
+    import socket
+    base = _WHATSAPP_PAIRING_PORT_BASE
+    for offset in range(0, 50):
+        candidate = base + offset
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", candidate))
+                return candidate
+            except OSError:
+                continue
+    return base  # fall through; the bridge will fail-fast on EADDRINUSE
+
+
+def _whatsapp_pairing_bridge_url(port: int, path: str) -> str:
+    return f"http://127.0.0.1:{port}{path}"
+
+
+def _read_whatsapp_pairing_status(port: int) -> dict[str, Any]:
+    """Synchronous GET against the pairing bridge's /health.
+
+    Returns the full /health payload, or ``{"status": "unreachable", "error": ...}``
+    if the bridge is not yet listening. Never raises — callers decide how
+    to interpret a missing bridge.
+    """
+    import urllib.error
+    import urllib.request
+    url = _whatsapp_pairing_bridge_url(port, "/health")
+    try:
+        with urllib.request.urlopen(url, timeout=_WHATSAPP_PAIRING_HTTP_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+    except (urllib.error.URLError, ConnectionError, OSError, json.JSONDecodeError) as exc:
+        return {"status": "unreachable", "error": str(exc)}
+
+
+def _resolve_whatsapp_bridge_path() -> Optional[Path]:
+    """Locate the bridge.js the dashboard should spawn.
+
+    Order:
+      1. WHATSAPP_BRIDGE_SCRIPT env var (explicit override)
+      2. The bundled scripts/whatsapp-bridge/bridge.js next to the repo
+    Returns None when nothing usable is found so the endpoint can 500 with
+    a clear message instead of failing deep inside subprocess.Popen.
+    """
+    override = os.environ.get("WHATSAPP_BRIDGE_SCRIPT")
+    if override:
+        p = Path(override).expanduser()
+        if p.exists():
+            return p
+    if _WHATSAPP_DEFAULT_BRIDGE.exists():
+        return _WHATSAPP_DEFAULT_BRIDGE
+    return None
+
+
+class WhatsappOnboardingStart(BaseModel):
+    # ``phone`` is required for ``mode="phone"`` and MUST be a valid
+    # E.164-ish number without ``+`` (the bridge strips the leading
+    # ``+`` because Baileys ``requestPairingCode`` rejects it). For
+    # ``mode="qr"`` the field is ignored — the user scans the QR
+    # rendered by the bridge into the dashboard.
+    phone: str = ""
+    # ``mode`` selects the pairing flow:
+    #   ``"phone"`` → 8-char pairing code (default if ``phone`` is set)
+    #   ``"qr"``    → QR data URL displayed in the dashboard
+    # Defaults to ``"phone"`` when the client omits it so the existing
+    # call sites don't break.
+    mode: Optional[str] = None
+
+
+@app.post("/api/messaging/whatsapp/onboarding/start")
+async def start_whatsapp_onboarding(body: WhatsappOnboardingStart):
+    """Spawn a dedicated pairing bridge for the given phone number.
+
+    Returns the ``pairing_id`` the dashboard polls against. The actual
+    8-char pairing code is fetched later via /status — Baileys does not
+    generate the code synchronously, so we cannot return it in this
+    response. Pairing codes are valid for ~60s; the UI must re-poll.
+    """
+    phone = re.sub(r"\D+", "", (body.phone or "").lstrip("+"))
+    # ``mode`` selects the pairing flow. Defaults:
+    #   - ``body.mode`` wins when set explicitly (the dashboard sends
+    #     ``"qr"`` from the QR radio button)
+    #   - when the body sends a phone number and no mode, default to
+    #     ``"phone"`` (existing call sites keep working)
+    #   - when the body sends neither, default to ``"qr"`` so the
+    #     "Pair with QR" button does not need to send a phone
+    mode = (body.mode or "").strip().lower() or None
+    if mode not in (None, "phone", "qr"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported pairing mode: {mode!r}. Use 'phone' or 'qr'.",
+        )
+    if mode is None:
+        mode = "phone" if phone else "qr"
+    if mode == "phone" and not _WHATSAPP_PHONE_RE.fullmatch(phone):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Phone number must be 6-15 digits in E.164 format "
+                "(e.g. 6281234567890) when mode='phone'."
+            ),
+        )
+
+    bridge_path = _resolve_whatsapp_bridge_path()
+    if bridge_path is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "WhatsApp bridge.js not found. Set WHATSAPP_BRIDGE_SCRIPT "
+                f"or restore { _WHATSAPP_DEFAULT_BRIDGE }."
+            ),
+        )
+    node_bin = shutil.which("node")
+    if not node_bin:
+        raise HTTPException(
+            status_code=500,
+            detail="Node.js is not installed — pairing requires Node.",
+        )
+
+    # One pairing at a time per dashboard. Reject instead of stacking
+    # concurrent bridges (avoids port + creds races).
+    with _whatsapp_onboarding_lock:
+        _prune_whatsapp_onboarding_pairings()
+        if _whatsapp_onboarding_pairings:
+            active = next(iter(_whatsapp_onboarding_pairings.values()))
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A WhatsApp pairing is already in progress. "
+                    "Cancel it before starting a new one."
+                ),
+            )
+
+    port = _allocate_whatsapp_pairing_port()
+    session_dir = _WHATSAPP_DEFAULT_SESSION_DIR
+    session_dir.mkdir(parents=True, exist_ok=True)
+    log_path = session_dir.parent / f"bridge.pair.{port}.log"
+
+    # Build the args. `--pair-only` keeps the bridge alive in a minimal
+    # HTTP server (does not exit on connect, does not start the message
+    # queue). `--phone=...` triggers requestPairingCode on the first QR
+    # event. `--port` and `--session` override the bridge's defaults.
+    cmd = [
+        node_bin,
+        str(bridge_path),
+        "--pair-only",
+    ]
+    if mode == "phone":
+        cmd.append(f"--phone={phone}")
+    cmd.append(f"--port={port}")
+    cmd.append(f"--session={session_dir}")
+    log_fh = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(bridge_path.parent),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            env=os.environ.copy(),
+        )
+    except Exception as exc:
+        log_fh.close()
+        _log.exception("Failed to spawn WhatsApp pairing bridge")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to spawn WhatsApp pairing bridge: {exc}",
+        ) from exc
+
+    pairing_id = secrets.token_urlsafe(12)
+    rec = _WhatsappOnboardingPairing(
+        phone=phone,
+        session_dir=str(session_dir),
+        port=port,
+        proc=proc,
+        started_at=time.time(),
+        log_path=log_path,
+        mode=mode,
+    )
+    with _whatsapp_onboarding_lock:
+        _whatsapp_onboarding_pairings[pairing_id] = rec
+
+    _log.info(
+        "WhatsApp pairing started: mode=%s phone=%s port=%d pid=%d log=%s",
+        mode, phone, port, proc.pid, log_path,
+    )
+    return {
+        "pairing_id": pairing_id,
+        "phone": phone,
+        "mode": mode,
+        "port": port,
+        "log_path": str(log_path),
+        "started_at": rec.started_at,
+        "expires_at": rec.started_at + _WHATSAPP_PAIRING_TTL_SECONDS,
+    }
+
+
+@app.get("/api/messaging/whatsapp/onboarding/{pairing_id}")
+async def get_whatsapp_onboarding_status(pairing_id: str):
+    """Poll the pairing bridge's /health and surface the pairing code.
+
+    State machine for the dashboard:
+      - "starting": bridge process alive but /health unreachable yet
+        (Baileys bootstrapping). Frontend should keep polling.
+      - "waiting": /health reachable, no code yet (QR not generated).
+      - "code": pairing code is ready, user should enter it in WA phone.
+      - "paired": connection === 'open', creds.json written. Frontend
+        should offer an "I have paired" / apply button.
+      - "error": /health reports a pairing error (e.g. requestPairingCode
+        failed). Frontend should let the user retry.
+    """
+    with _whatsapp_onboarding_lock:
+        rec = _whatsapp_onboarding_pairings.get(pairing_id)
+    if rec is None:
+        raise HTTPException(
+            status_code=404,
+            detail="WhatsApp pairing session was not found. Start a new setup.",
+        )
+
+    proc_alive = rec.proc.poll() is None
+    if not proc_alive:
+        return {
+            "status": "exited",
+            "phone": rec.phone,
+            "exit_code": rec.proc.returncode,
+            "log_path": str(rec.log_path),
+        }
+
+    health = _read_whatsapp_pairing_status(rec.port)
+    if health.get("status") == "unreachable":
+        return {
+            "status": "starting",
+            "mode": rec.mode,
+            "phone": rec.phone,
+            "log_path": str(rec.log_path),
+        }
+
+    pairing = health.get("pairing") or {}
+    # The bridge reports ``mode`` in /health — prefer it over the value
+    # we cached at start time (the user could have set the mode to
+    # something defaultable and we want the live state).
+    effective_mode = pairing.get("mode") or rec.mode
+
+    if pairing.get("paired"):
+        if not rec.paired:
+            rec.paired = True
+        return {
+            "status": "paired",
+            "mode": effective_mode,
+            "phone": rec.phone,
+            "code": pairing.get("code") or rec.last_code,
+            "log_path": str(rec.log_path),
+        }
+    if pairing.get("error"):
+        rec.last_error = str(pairing.get("error"))
+        return {
+            "status": "error",
+            "mode": effective_mode,
+            "phone": rec.phone,
+            "error": rec.last_error,
+            "log_path": str(rec.log_path),
+        }
+    if pairing.get("code"):
+        rec.last_code = str(pairing.get("code"))
+        return {
+            "status": "code",
+            "mode": effective_mode,
+            "phone": rec.phone,
+            "code": rec.last_code,
+            "log_path": str(rec.log_path),
+        }
+
+    # QR mode: fetch the latest PNG data URL. Done here (not in the
+    # bridge event handler) so a missed emit doesn't leave the UI
+    # stuck on a stale image — every poll re-reads.
+    qr_data_url = None
+    if effective_mode == "qr":
+        try:
+            import httpx
+            qr_resp = httpx.get(
+                f"http://127.0.0.1:{rec.port}/pairing-qr",
+                timeout=2.0,
+            )
+            if qr_resp.status_code == 200:
+                qr_payload = qr_resp.json()
+                qr_data_url = qr_payload.get("qr")
+                rec.last_qr = qr_data_url or rec.last_qr
+        except Exception:
+            qr_data_url = rec.last_qr or None
+
+    return {
+        "status": "waiting" if effective_mode == "qr" else "waiting",
+        "mode": effective_mode,
+        "phone": rec.phone,
+        "qr": qr_data_url,
+        "log_path": str(rec.log_path),
+    }
+
+
+@app.post("/api/messaging/whatsapp/onboarding/{pairing_id}/apply")
+async def apply_whatsapp_onboarding(pairing_id: str):
+    """Finish the WhatsApp pairing flow.
+
+    Steps:
+      1. Verify the bridge is reporting `paired: true` (creds.json exists
+         and the connection is open). If not, 409.
+      2. Ensure WHATSAPP_ENABLED=true in config.yaml.
+      3. Kill the pairing bridge subprocess so the gateway can start a
+         fresh full bridge on its next reconnect.
+      4. Trigger a gateway restart via the same helper the Telegram
+         onboarding uses, so the user sees a single restart for both.
+    """
+    with _whatsapp_onboarding_lock:
+        rec = _whatsapp_onboarding_pairings.get(pairing_id)
+    if rec is None:
+        raise HTTPException(
+            status_code=404,
+            detail="WhatsApp pairing session was not found.",
+        )
+
+    # Re-check the bridge to make sure the user actually completed the
+    # phone-side pairing. Cheaper than checking creds.json ourselves
+    # (the bridge is the source of truth for the WA session lifecycle).
+    health = _read_whatsapp_pairing_status(rec.port)
+    pairing = health.get("pairing") or {}
+    if not pairing.get("paired"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "WhatsApp pairing is not complete yet. Enter the code in "
+                "WhatsApp on your phone, then try again."
+            ),
+        )
+
+    try:
+        _write_platform_enabled("whatsapp", True)
+    except Exception as exc:
+        _log.exception("Failed to enable WhatsApp platform after pairing")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to enable WhatsApp: {exc}",
+        ) from exc
+
+    # Kill the pairing bridge so the gateway restarts a full one
+    # pointing at the now-persisted creds.json.
+    _kill_whatsapp_pairing_pairing(pairing_id)
+
+    with _whatsapp_onboarding_lock:
+        _whatsapp_onboarding_pairings.pop(pairing_id, None)
+
+    restart_result = _restart_gateway_after_telegram_onboarding()
+    return {
+        "ok": True,
+        "platform": "whatsapp",
+        "phone": rec.phone,
+        "needs_restart": not restart_result["restart_started"],
+        **restart_result,
+    }
+
+
+@app.delete("/api/messaging/whatsapp/onboarding/{pairing_id}")
+async def cancel_whatsapp_onboarding(pairing_id: str):
+    """Abort the pairing flow and tear down the bridge.
+
+    The dashboard should always DELETE on cancel/unmount — a leaked
+    bridge process holds a /port and will eventually time out the
+    pairing. We do NOT delete creds.json here; the user might have
+    partially completed and want to retry.
+    """
+    _kill_whatsapp_pairing_pairing(pairing_id)
+    with _whatsapp_onboarding_lock:
+        _whatsapp_onboarding_pairings.pop(pairing_id, None)
+    return {"ok": True}
+
+
 @app.get("/api/messaging/platforms")
 async def get_messaging_platforms(profile: Optional[str] = None):
     # Profile-scoped so the dashboard's global profile switcher shows the
@@ -6550,6 +7067,31 @@ async def export_session_endpoint(session_id: str):
         return data
     finally:
         db.close()
+
+
+class ChatPromptBody(BaseModel):
+    id: str
+    prompt: str
+
+
+@app.post("/api/sessions/chat-prompt-proxy")
+async def chat_prompt_proxy_endpoint(body: ChatPromptBody):
+    import httpx
+    # Proxy to the in-memory api-server gateway that handles stateless completion with SessionDB persistence.
+    from gateway.config import load_gateway_config, Platform
+    cfg = load_gateway_config()
+    # default port for api-server is 9120
+    api_port = 9120
+    if Platform.API_SERVER in cfg.platforms:
+        api_port = cfg.platforms[Platform.API_SERVER].extra.get("port") or 9120
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        # call /api/sessions/{session_id}/chat which runs the agent
+        url = f"http://127.0.0.1:{api_port}/api/sessions/{urllib.parse.quote(body.id)}/chat"
+        # pass request forward
+        resp = await client.post(url, json={"message": body.prompt})
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        return {"ok": True}
 
 
 class SessionPrune(BaseModel):
