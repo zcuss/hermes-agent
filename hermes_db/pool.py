@@ -99,10 +99,15 @@ class CockroachStore:
                     system_prompt, parent_session_id, started_at, cwd, title, metadata
                 ) VALUES (%s,%s,%s,%s,%s,%s,%s::JSONB,%s,%s,%s,%s,%s,%s::JSONB)
                 ON CONFLICT (id) DO UPDATE SET
-                    source=EXCLUDED.source, user_id=EXCLUDED.user_id, model=EXCLUDED.model,
-                    model_config=EXCLUDED.model_config, system_prompt=EXCLUDED.system_prompt,
-                    parent_session_id=EXCLUDED.parent_session_id, cwd=EXCLUDED.cwd,
-                    title=EXCLUDED.title, metadata=EXCLUDED.metadata
+                    source=EXCLUDED.source,
+                    user_id=COALESCE(EXCLUDED.user_id, hermes_sessions.user_id),
+                    model=COALESCE(EXCLUDED.model, hermes_sessions.model),
+                    model_config=COALESCE(EXCLUDED.model_config, hermes_sessions.model_config),
+                    system_prompt=COALESCE(EXCLUDED.system_prompt, hermes_sessions.system_prompt),
+                    parent_session_id=COALESCE(EXCLUDED.parent_session_id, hermes_sessions.parent_session_id),
+                    cwd=COALESCE(EXCLUDED.cwd, hermes_sessions.cwd),
+                    title=COALESCE(EXCLUDED.title, hermes_sessions.title),
+                    metadata=COALESCE(EXCLUDED.metadata, hermes_sessions.metadata)
                 """,
                 (
                     session_id,

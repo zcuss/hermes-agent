@@ -66,6 +66,98 @@ hermes              # start chatting!
 
 ---
 
+## CockroachDB-only durable state
+
+This fork runs Hermes session state on CockroachDB/Postgres instead of the
+original local SQLite `~/.hermes/state.db`. There is no SQLite fallback: set a
+CockroachDB/Postgres URL before starting `hermes`, `hermes gateway`, or
+`hermes dashboard`.
+
+### Fresh install with local CockroachDB
+
+```bash
+# 1) Install Hermes normally
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+
+# 2) Install CockroachDB if it is not already installed
+curl https://binaries.cockroachdb.com/cockroach-v24.3.9.linux-amd64.tgz | tar -xz
+sudo cp cockroach-v24.3.9.linux-amd64/cockroach /usr/local/bin/
+
+# 3) Start a single-node dev database
+mkdir -p ~/.hermes/cockroach
+cockroach start-single-node \
+  --insecure \
+  --listen-addr=127.0.0.1:26257 \
+  --http-addr=127.0.0.1:8080 \
+  --store ~/.hermes/cockroach
+
+# 4) Create the Hermes database
+cockroach sql --insecure --host=127.0.0.1:26257 \
+  -e 'CREATE DATABASE IF NOT EXISTS hermes;'
+
+# 5) Point Hermes at CockroachDB
+hermes config set database.url 'postgresql://root@127.0.0.1:26257/hermes?sslmode=disable'
+# Or export it for service managers / shells:
+export HERMES_DATABASE_URL='postgresql://root@127.0.0.1:26257/hermes?sslmode=disable'
+
+# 6) Verify schema + connectivity
+hermes db status
+hermes
+```
+
+### Production notes
+
+Use secure CockroachDB/Postgres credentials in production:
+
+```yaml
+# ~/.hermes/config.yaml
+database:
+  url: postgresql://hermes:<password>@db.example.com:26257/hermes?sslmode=require
+  cluster_name: prod
+  profile: default
+  pool_min: 1
+  pool_max: 8
+```
+
+`HERMES_DATABASE_URL` overrides `database.url`. `database.url` also implies the
+CockroachDB backend, so `database.backend` is optional.
+
+### Migrating from original Hermes Agent
+
+1. Stop Hermes processes so SQLite is not changing while exporting:
+
+```bash
+hermes gateway stop || true
+pkill -f 'hermes dashboard' || true
+```
+
+2. Back up the original local state:
+
+```bash
+cp -a ~/.hermes/state.db ~/.hermes/state.db.backup.$(date +%Y%m%d_%H%M%S)
+cp -a ~/.hermes/sessions ~/.hermes/sessions.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+```
+
+3. Start CockroachDB and set `database.url` as shown above.
+
+4. Run the migration importer when available:
+
+```bash
+hermes db migrate-sqlite --source ~/.hermes/state.db
+```
+
+If your checkout does not include `migrate-sqlite` yet, keep the backup and
+start fresh on CockroachDB; this fork will not read `state.db` directly.
+
+5. Verify:
+
+```bash
+hermes db status
+hermes sessions list
+```
+
+---
+
 ## Getting Started
 
 ```bash
