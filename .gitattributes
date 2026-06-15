@@ -22,8 +22,8 @@ docker/entrypoint.sh text eol=lf
 # are intentionally allowed to flow upstream's way — the script pauses on
 # conflict for human review.
 # ---------------------------------------------------------------------------
-/hermes_db/                         merge=ours
-/hermes_cluster/                    merge=ours
+/hermes_db/**                       merge=ours
+/hermes_cluster/**                  merge=ours
 /hermes_state.py                    merge=ours
 /docs/cockroach-cluster.md          merge=ours
 /tests/test_hermes_state.py         merge=ours
