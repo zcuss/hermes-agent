@@ -22,7 +22,12 @@ from hermes_state import (
 
 DB_URL = os.environ.get(
     "HERMES_TEST_DATABASE_URL",
-    "postgresql://root@127.0.0.1:26257/hermes_test?sslmode=disable",
+    "postgresql://root@127.0.0.1:26257/defaultdb?sslmode=disable",
+)
+_SKIP_UNLESS_DB = os.environ.get("HERMES_TEST_DATABASE_URL") or os.environ.get("HERMES_DATABASE_URL")
+pytestmark = pytest.mark.skipif(
+    not _SKIP_UNLESS_DB,
+    reason="CockroachDB test env not configured (set HERMES_TEST_DATABASE_URL or HERMES_DATABASE_URL)",
 )
 
 
