@@ -8,3 +8,24 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# ---------------------------------------------------------------------------
+# zcuss fork divergence: keep these paths on the fork's side on auto-merge.
+# Upstream (NousResearch) doesn't ship CockroachDB / cluster / chatv2, so
+# their main will keep rewriting these files toward SQLite/chatv1; this
+# attribute tells `git merge upstream/main` to silently keep ours, and the
+# sync script in scripts/sync_upstream.sh reports what got skipped.
+#
+# Only paths that are ENTIRELY zcuss-introduced are listed. Files we patched
+# (hermes_cli/main.py, hermes_cli/web_server.py, scripts/whatsapp-bridge/*,
+# web/src/lib/api.ts, web/src/pages/ChannelsPage.tsx, README.md, .gitignore)
+# are intentionally allowed to flow upstream's way — the script pauses on
+# conflict for human review.
+# ---------------------------------------------------------------------------
+/hermes_db/                         merge=ours
+/hermes_cluster/                    merge=ours
+/hermes_state.py                    merge=ours
+/docs/cockroach-cluster.md          merge=ours
+/tests/test_hermes_state.py         merge=ours
+/tests/test_hermes_db_cluster.py    merge=ours
+/tests/hermes_cli/test_dashboard_embedded_chat_default.py merge=ours
