@@ -38,8 +38,15 @@
 <div dir="ltr">
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zcuss/hermes-agent/main/install.sh | bash
 ```
+
+> یہ zcuss fork کا انسٹالر ہے۔ یہ `zcuss/hermes-agent` کو کلون کرتا ہے اور
+> venv، ڈیپس، CLI سم لنک اور سیٹ اپ وزرڈ کے لیے `setup-hermes.sh` کو
+> ہاتھ دیتا ہے۔ `--help` آپشنز دکھاتا ہے۔ ہم نے Nous Research کا اپ
+> سٹریم انسٹالر اب سپورٹ نہیں کیا۔ اس fork کی سیشن اسٹیٹ CockroachDB پر
+> ہے — ڈیٹابیس سیٹ اپ کے لیے README.md کا "CockroachDB-only durable state"
+> سیکشن دیکھیں۔
 
 </div>
 
@@ -52,7 +59,7 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 <div dir="ltr">
 
 ```powershell
-iex (irm https://hermes-agent.nousresearch.com/install.ps1)
+iex (irm https://raw.githubusercontent.com/zcuss/hermes-agent/main/scripts/install.ps1)
 ```
 
 </div>

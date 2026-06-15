@@ -32,8 +32,14 @@
 ## 快速安装
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zcuss/hermes-agent/main/install.sh | bash
 ```
+
+> 这是 zcuss fork 的安装脚本。它会克隆 `zcuss/hermes-agent`，然后调用
+> `setup-hermes.sh` 完成 venv 搭建、依赖安装、CLI 软链和初始化向导。
+> 传递 `--help` 查看所有选项。Nous Research 上游安装脚本已不再是本 fork
+> 的支持安装方式。本 fork 的会话状态使用 CockroachDB，数据库配置见下方
+> "CockroachDB 数据库设置"。
 
 支持 Linux、macOS、WSL2 和 Android (Termux)。安装程序会自动处理平台特定的配置。
 

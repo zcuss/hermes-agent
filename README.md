@@ -36,8 +36,13 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 ### Linux, macOS, WSL2, Termux
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zcuss/hermes-agent/main/install.sh | bash
 ```
+
+> This is the zcuss fork installer. It clones `zcuss/hermes-agent` and hands
+> off to `setup-hermes.sh`, which sets up the venv, deps, CLI symlink, and
+> setup wizard. Pass `--help` for options. The upstream Nous Research
+> installer is no longer the supported install path on this fork.
 
 ### Windows (native, PowerShell)
 
@@ -46,7 +51,7 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 Run this in PowerShell:
 
 ```powershell
-iex (irm https://hermes-agent.nousresearch.com/install.ps1)
+iex (irm https://raw.githubusercontent.com/zcuss/hermes-agent/main/scripts/install.ps1)
 ```
 
 The installer handles everything: uv, Python 3.11, Node.js, ripgrep, ffmpeg, **and a portable Git Bash** (MinGit, unpacked to `%LOCALAPPDATA%\hermes\git` — no admin required, completely isolated from any system Git install). Hermes uses this bundled Git Bash to run shell commands.
@@ -77,7 +82,7 @@ CockroachDB/Postgres URL before starting `hermes`, `hermes gateway`, or
 
 ```bash
 # 1) Install Hermes normally
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zcuss/hermes-agent/main/install.sh | bash
 
 # 2) Install CockroachDB if it is not already installed
 curl https://binaries.cockroachdb.com/cockroach-v24.3.9.linux-amd64.tgz | tar -xz
@@ -90,7 +95,8 @@ cockroach start-single-node \
   --listen-addr=127.0.0.1:26357 \
   --sql-addr=127.0.0.1:26257 \
   --http-addr=127.0.0.1:8080 \
-  --store ~/.hermes/cockroach
+  --store ~/.hermes/cockroach \
+  --background
 
 # 4) Create the Hermes database
 cockroach sql --insecure --host=127.0.0.1:26257 \
@@ -101,7 +107,10 @@ hermes config set database.url 'postgresql://root@127.0.0.1:26257/hermes?sslmode
 # Or export it for service managers / shells:
 export HERMES_DATABASE_URL='postgresql://root@127.0.0.1:26257/hermes?sslmode=disable'
 
-# 6) Verify schema + connectivity
+# 6) Initialize the Hermes schema (idempotent — safe to re-run on upgrade)
+hermes db init
+
+# 7) Verify schema + connectivity, then start chatting
 hermes db status
 hermes
 ```

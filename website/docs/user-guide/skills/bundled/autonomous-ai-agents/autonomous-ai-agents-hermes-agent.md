@@ -52,7 +52,7 @@ People use Hermes for software development, research, system administration, dat
 
 ```bash
 # Install
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zcuss/hermes-agent/main/install.sh | bash
 
 # Interactive chat (default)
 hermes
