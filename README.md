@@ -123,6 +123,22 @@ database:
 `HERMES_DATABASE_URL` overrides `database.url`. `database.url` also implies the
 CockroachDB backend, so `database.backend` is optional.
 
+### CockroachDB Cloud (verify-full)
+
+```bash
+# User names with mixed case need libpq keyword/value form so the case
+# is preserved (URL form folds to lowercase).
+hermes config set database.url \
+  "host=<cluster-host> port=26257 dbname=<database> user=<User> password=<password> sslmode=verify-full sslrootcert=/etc/ssl/certs/ISRG_Root_X1.pem"
+
+# or:
+export HERMES_DATABASE_URL='host=<cluster-host> port=26257 dbname=<database> user=<User> password=<password> sslmode=verify-full sslrootcert=/etc/ssl/certs/ISRG_Root_X1.pem'
+```
+
+`sslrootcert=system` is supported on hosts that ship the ISRG root in the
+system trust store; point at the explicit file when running on a minimal
+container that does not.
+
 ### Migrating from original Hermes Agent
 
 1. Stop Hermes processes so SQLite is not changing while exporting:
