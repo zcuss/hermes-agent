@@ -177,6 +177,41 @@ hermes sessions list
 
 ## Getting Started
 
+## Upstream sync (NousResearch → zcuss fork)
+
+This fork pulls in NousResearch upstream changes on a schedule while
+preserving the CockroachDB / cluster / chatv2 work that lives only here.
+
+```bash
+# one-shot, local
+scripts/sync_upstream.sh
+
+# review, then push
+git push origin main
+
+# automated daily at 03:17 UTC (workflow: .github/workflows/sync-upstream.yml)
+```
+
+Mechanics:
+
+1. `upstream` remote points at `https://github.com/NousResearch/hermes-agent.git`
+   (push is disabled so we never write to the upstream).
+2. `.gitattributes` declares `merge=ours` on every zcuss-only path
+   (`hermes_db/`, `hermes_cluster/`, `hermes_state.py`,
+   `docs/cockroach-cluster.md`, the related test files). These files are
+   silently kept on the fork's side on every sync.
+3. Files zcuss *patched* rather than introduced (e.g. `hermes_cli/main.py`,
+   `hermes_cli/web_server.py`, `scripts/whatsapp-bridge/`, `web/src/lib/api.ts`,
+   `web/src/pages/ChannelsPage.tsx`, `README.md`, `.gitignore`) are allowed to
+   receive upstream changes. When a real conflict occurs, `git merge` aborts
+   and the script exits non-zero so the conflict can be resolved by hand.
+4. After a clean merge the script runs the fork's regression tests
+   (`tests/test_hermes_state.py`, `tests/test_hermes_db_cluster.py`,
+   `tests/hermes_cli/test_dashboard_embedded_chat_default.py`).
+5. The GitHub workflow opens no PRs of its own; an unattended conflict
+   fails the workflow and emits a clear diff in the run log.
+
+
 ```bash
 hermes              # Interactive CLI — start a conversation
 hermes model        # Choose your LLM provider and model
