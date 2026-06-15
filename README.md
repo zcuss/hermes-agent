@@ -87,7 +87,8 @@ sudo cp cockroach-v24.3.9.linux-amd64/cockroach /usr/local/bin/
 mkdir -p ~/.hermes/cockroach
 cockroach start-single-node \
   --insecure \
-  --listen-addr=127.0.0.1:26257 \
+  --listen-addr=127.0.0.1:26357 \
+  --sql-addr=127.0.0.1:26257 \
   --http-addr=127.0.0.1:8080 \
   --store ~/.hermes/cockroach
 

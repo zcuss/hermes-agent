@@ -18,6 +18,8 @@ __pycache__/
 .notebooklm-cli-venv/
 .notebooklm-playwright/
 .pip-cache/
+/node1/
+/cockroach-data/
 .uv-cache/
 compose.hermes.local.yml
 export*
