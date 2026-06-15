@@ -189,7 +189,7 @@ scripts/sync_upstream.sh
 # review, then push
 git push origin main
 
-# automated daily at 03:17 UTC (workflow: .github/workflows/sync-upstream.yml)
+# automated daily at 03:17 UTC (workflow: .github/workflows/zcuss.yml (job: sync-upstream))
 ```
 
 Mechanics:

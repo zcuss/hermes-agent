@@ -1,0 +1,87 @@
+name: zcuss
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  COCKROACH_VERSION: "v24.3.5"
+  HERMES_TEST_DATABASE_URL: "host=127.0.0.1 port=26257 dbname=defaultdb user=root sslmode=disable"
+
+jobs:
+  uv-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - run: uv lock --check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+      - run: uv python install $PYTHON_VERSION
+      - run: uv sync --locked --python $PYTHON_VERSION --extra all --extra dev
+      - run: uv run ruff check hermes_db hermes_cluster hermes_state.py hermes_cli/web_server.py tests/test_hermes_state.py tests/test_hermes_db_cluster.py tests/hermes_cli/test_dashboard_embedded_chat_default.py
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+      - run: uv python install $PYTHON_VERSION
+      - run: uv sync --locked --python $PYTHON_VERSION --extra all --extra dev
+      - name: Start CockroachDB on localhost
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSLO "https://binaries.cockroachdb.com/cockroach-${COCKROACH_VERSION}.linux-amd64.tgz"
+          tar -xzf "cockroach-${COCKROACH_VERSION}.linux-amd64.tgz"
+          sudo cp "cockroach-${COCKROACH_VERSION}.linux-amd64/cockroach" /usr/local/bin/
+          cockroach start-single-node --insecure \
+            --listen-addr=127.0.0.1:26357 \
+            --sql-addr=127.0.0.1:26257 \
+            --http-addr=127.0.0.1:8080 \
+            --store=/tmp/cockroach-data \
+            --background \
+            --pid-file=/tmp/cockroach.pid
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/health?ready=1 >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/cockroach-data/logs/cockroach*.log || true
+          exit 1
+      - run: uv run pytest tests/test_hermes_state.py tests/test_hermes_db_cluster.py tests/hermes_cli/test_dashboard_embedded_chat_default.py -q -o 'addopts='
+
+  sync-upstream:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [uv-lock, lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      - run: scripts/sync_upstream.sh --no-tests --push
