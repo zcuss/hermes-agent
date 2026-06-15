@@ -185,13 +185,14 @@ app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 _SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
-# In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the
-# desktop app and the dashboard's own Chat tab both drive the agent over the
-# `/api/ws` + `/api/pty` WebSockets, so the embedded-chat surface is an
-# unconditional part of the dashboard.  Kept as a module-level constant (rather
-# than inlining ``True`` at every gate) so the WS endpoints and the SPA token
-# injection share a single, testable seam.
-_DASHBOARD_EMBEDDED_CHAT_ENABLED = True
+# In-browser Chat tab (/chat, /api/pty, /api/ws, …).
+# On small VPSes, browser reloads can repeatedly spawn PTY/TUI children before
+# the old WebSocket cleanup finishes, causing CPU/RAM spikes. Keep the chat
+# transport opt-in for server dashboards; desktop can still enable it via env.
+_DASHBOARD_EMBEDDED_CHAT_ENABLED = env_var_enabled(
+    "HERMES_DASHBOARD_EMBEDDED_CHAT",
+    default=os.getenv("HERMES_DESKTOP") == "1",
+)
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
